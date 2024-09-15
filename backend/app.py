@@ -15,6 +15,7 @@ from tensorflow.keras.optimizers import Adamax
 import numpy as np
 from PIL import Image
 import collections
+import cv2
 
 app = Flask(__name__)
 CORS(app)
@@ -29,6 +30,9 @@ app.config['JWT_SECRET_KEY'] = os.getenv('JWT_SECRET_KEY', secrets.token_hex(32)
 mysql = MySQL(app)
 bcrypt = Bcrypt(app)
 jwt = JWTManager(app)
+
+#########################################################################################
+
 
 # Smoothing window size
 SMOOTHING_WINDOW = 5
@@ -55,33 +59,65 @@ def load_model_from_db():
     except Exception as e:
         print(f"Error loading model from database: {str(e)}")
         raise
-
+    
 # Load the model using app context
 with app.app_context():
     model = load_model_from_db()
+    
+import base64
+import io
 
 @app.route('/api/emotion-capture', methods=['POST'])
 def emotion_capture():
     try:
         file = request.files['image']
         image = Image.open(file.stream)
+
+        # Process image: Convert to grayscale and crop the face
+        img_array, face_detected, processed_face = process_image(image)
         
-        # Process image
-        img_array = process_image(image)
-        
-        # Predict emotion
+        if not face_detected:
+            return jsonify({'error': 'No face detected'}), 400
+
+        # Predict emotion if a face is detected
         predicted_emotion = predict_emotion(img_array)
-        
-        return jsonify({'emotion': predicted_emotion})
+
+        # Encode the processed image (grayscale + cropped) as base64
+        _, buffer = cv2.imencode('.jpg', processed_face)
+        face_image_base64 = base64.b64encode(buffer).decode('utf-8')
+
+        return jsonify({
+            'emotion': predicted_emotion,
+            'face_image': face_image_base64
+        })
     
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
 def process_image(image):
-    img = image.resize((224, 224))
-    img_array = tf.keras.preprocessing.image.img_to_array(img)
-    img_array = np.expand_dims(img_array, 0)  # Add batch dimension
-    return img_array
+    # Convert the image to grayscale
+    img = np.array(image.convert('L'))
+    
+    # Load OpenCV's pre-trained Haarcascade for face detection
+    face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+    
+    # Detect faces in the image
+    faces = face_cascade.detectMultiScale(img, 1.3, 5)
+    
+    if len(faces) > 0:
+        # If faces are found, crop the first face detected
+        (x, y, w, h) = faces[0]
+        cropped_face = img[y:y+h, x:x+w]
+
+        # Resize the cropped face to the size expected by the model
+        cropped_face_resized = cv2.resize(cropped_face, (224, 224))
+        
+        # Normalize and expand dimensions for model prediction
+        img_array = np.expand_dims(cropped_face_resized, axis=(0, -1))  # Add batch and channel dimensions
+        return img_array, True, cropped_face
+    else:
+        return None, False, None
+
 
 def predict_emotion(img_array):
     predictions = model.predict(img_array)
@@ -93,6 +129,10 @@ def predict_emotion(img_array):
     smoothed_emotion = max(set(smoothed_predictions), key=smoothed_predictions.count)
     
     return smoothed_emotion
+
+
+##############################################################################################
+
 
 # Registration route
 @app.route('/api/register', methods=['POST'])
